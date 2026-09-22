@@ -54,39 +54,28 @@ class CloudOptimizer:
     # 1. MIXED PRECISION
     # =================================================================
     def implement_mixed_precision(self):
-        """
-        Implement mixed precision training/inference for cloud deployment.
-
-        - Enables the `mixed_float16` global policy (float16 compute, float32 master weights)
-        - Rebuilds the model so all layers inherit the new policy
-        - Keeps the final softmax layer in float32 for numerical stability
-        - Loss scaling is handled automatically by Keras when mixed_float16 is active
-
-        Returns:
-            tf.keras.Model: Model optimized with mixed precision
-        """
         print("\n" + "=" * 60)
         print("[Mixed Precision] Enabling mixed_float16 policy")
         print("=" * 60)
 
-        # Enable global mixed precision policy
         mixed_precision.set_global_policy('mixed_float16')
         print(f"[Mixed Precision] Global policy → {mixed_precision.global_policy()}")
 
-        # Rebuild model from config so layers pick up the new dtype policy
-        model_config = self.baseline_model.get_config()
-        mp_model = tf.keras.Sequential.from_config(model_config)
+        # Ricostruisci il modello DA ZERO con la nuova policy
+        # (non usare from_config perché non eredita la policy)
+        mp_model = tf.keras.models.clone_model(self.baseline_model)
 
-        # Keep the output layer in float32 for numerical stability
-        try:
-            mp_model.layers[-1].dtype_policy = mixed_precision.Policy('float32')
-        except Exception:
-            pass  # Some Keras versions don't expose dtype_policy on layers
+        # Forza ogni layer ad usare la policy corrente
+        for layer in mp_model.layers:
+            if hasattr(layer, 'dtype_policy'):
+                layer.dtype_policy = mixed_precision.Policy('mixed_float16')
 
-        # Copy weights from baseline
+        # Output layer resta float32 per stabilità
+        mp_model.layers[-1].dtype_policy = mixed_precision.Policy('float32')
+
+        # Copia pesi
         mp_model.set_weights(self.baseline_model.get_weights())
 
-        # Compile with Adam; loss scaling is automatic under mixed_float16
         mp_model.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
             loss='sparse_categorical_crossentropy',
@@ -94,6 +83,7 @@ class CloudOptimizer:
         )
 
         print(f"[Mixed Precision] Model policy: {mp_model.dtype_policy}")
+        print(f"[Mixed Precision] First conv dtype: {mp_model.layers[0].dtype}")
         print(f"[Mixed Precision] Output dtype: {mp_model.layers[-1].dtype}")
 
         return mp_model
@@ -146,6 +136,7 @@ class CloudOptimizer:
         with strategy_obj.scope():
             model_config = self.baseline_model.get_config()
             dist_model = tf.keras.Sequential.from_config(model_config)
+            dist_model.set_weights(self.baseline_model.get_weights())
 
             # Scale learning rate linearly with the number of replicas
             base_lr = 1e-3
@@ -236,28 +227,28 @@ class CloudOptimizer:
             tf.keras.layers.Input(shape=(32, 32, 3), name='input'),
 
             # Block 1 (64 filters instead of 32)
-            tf.keras.layers.Conv2D(64, (3, 3), padding='same'),
+            tf.keras.layers.Conv2D(48, (3, 3), padding='same'),
             tf.keras.layers.BatchNormalization(),
             tf.keras.layers.ReLU(),
-            tf.keras.layers.Conv2D(64, (3, 3), padding='same'),
+            tf.keras.layers.Conv2D(48, (3, 3), padding='same'),
             tf.keras.layers.BatchNormalization(),
             tf.keras.layers.ReLU(),
             tf.keras.layers.MaxPooling2D((2, 2)),
 
             # Block 2 (128 filters instead of 64)
-            tf.keras.layers.Conv2D(128, (3, 3), padding='same'),
+            tf.keras.layers.Conv2D(96, (3, 3), padding='same'),
             tf.keras.layers.BatchNormalization(),
             tf.keras.layers.ReLU(),
-            tf.keras.layers.Conv2D(128, (3, 3), padding='same'),
+            tf.keras.layers.Conv2D(96, (3, 3), padding='same'),
             tf.keras.layers.BatchNormalization(),
             tf.keras.layers.ReLU(),
             tf.keras.layers.MaxPooling2D((2, 2)),
 
             # Block 3 (256 filters instead of 128)
-            tf.keras.layers.Conv2D(256, (3, 3), padding='same'),
+            tf.keras.layers.Conv2D(192, (3, 3), padding='same'),
             tf.keras.layers.BatchNormalization(),
             tf.keras.layers.ReLU(),
-            tf.keras.layers.Conv2D(256, (3, 3), padding='same'),
+            tf.keras.layers.Conv2D(192, (3, 3), padding='same'),
             tf.keras.layers.BatchNormalization(),
             tf.keras.layers.ReLU(),
             tf.keras.layers.MaxPooling2D((2, 2)),
@@ -280,6 +271,8 @@ class CloudOptimizer:
         # Student: same architecture as the baseline.
         # -------------------------------------------------------------
         student_model = tf.keras.models.clone_model(self.baseline_model)
+        student_model.set_weights(self.baseline_model.get_weights())  # <-- AGGIUNGI QUESTA RIGA
+
         student_model.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
             loss='sparse_categorical_crossentropy',
@@ -561,10 +554,15 @@ def benchmark_cloud_optimizations():
 
         # Short teacher training
         print("\n[KD] Teacher training (3 epochs)...")
-        teacher.fit(x_train_small, y_train_small,
-                    epochs=3, batch_size=128,
+        teacher.fit(x_train, y_train,
+                    epochs=15, batch_size=128,
+                    validation_data=(x_test, y_test),  # val
                     validation_split=0.1, verbose=1)
         _, teacher_acc = teacher.evaluate(x_test, y_test, verbose=0)
+
+        print(f"[KD] Teacher accuracy after training: {teacher_acc:.4f}")
+        if teacher_acc < 0.5:
+            print("[KD] WARNING: teacher under-trained, distillation will be poor")
 
         # Distill to student
         print("\n[KD] Distillation to student...")
@@ -572,8 +570,8 @@ def benchmark_cloud_optimizations():
             teacher, student,
             x_train_small, y_train_small,
             x_test, y_test,
-            epochs=3, batch_size=128,
-            temperature=4.0, alpha=0.3
+            epochs=10, batch_size=128,
+            temperature=4.0, alpha=0.7
         )
         _, student_acc = distilled_student.evaluate(x_test, y_test, verbose=0)
 

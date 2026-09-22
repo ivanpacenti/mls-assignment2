@@ -1,0 +1,19 @@
+{
+  "test_accuracy": 0.8299,
+  "test_loss": 0.6633415222167969,
+  "training_time_seconds": 961.2615690231323,
+  "num_epochs_trained": 25,
+  "total_params": 324394,
+  "trainable_params": 323498,
+  "non_trainable_params": 896,
+  "model_size_mb": 1.2374649047851562,
+  "single_sample_latency_ms": 15.12105941772461,
+  "batch32_latency_ms": 22.718429565429688,
+  "throughput_samples_per_sec": 1408.5480648140374,
+  "final_train_accuracy": 0.9453111290931702,
+  "final_val_accuracy": 0.7922000288963318,
+  "best_val_accuracy": 0.7976,
+  "best_val_loss": 0.7758259177207947,
+  "note": "Metrics from best checkpoint (epoch 24), not restored model (epoch 15)",
+  "test_accuracy_from_final_restored_model": 0.802
+}

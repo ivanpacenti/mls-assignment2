@@ -1,0 +1,109 @@
+{
+  "mixed_precision": {
+    "params": 324394,
+    "training_time_3ep_s": 13.17,
+    "fp32_training_time_3ep_s": 13.14,
+    "speedup_vs_fp32": 0.998,
+    "test_accuracy": 0.7991,
+    "fp32_test_accuracy": 0.8138,
+    "accuracy_delta": -0.0147,
+    "note": "Apple Silicon does not accelerate float16 on GPU; speedup limited on this hardware."
+  },
+  "model_parallelism": {
+    "strategy": "mirrored",
+    "num_replicas": 1,
+    "training_time_3ep_s": 12.71,
+    "test_accuracy": 0.7708,
+    "scaling_efficiency": "N/A \u2014 single device",
+    "note": "On this machine, MirroredStrategy falls back to CPU with 1 replica; scaling requires multi-GPU cluster."
+  },
+  "batch_processing": {
+    "64": {
+      "training_time_3ep_s": 13.85,
+      "throughput_samples_per_s": 2166.7,
+      "test_accuracy": 0.8025
+    },
+    "128": {
+      "training_time_3ep_s": 13.11,
+      "throughput_samples_per_s": 2287.9,
+      "test_accuracy": 0.7729
+    },
+    "256": {
+      "training_time_3ep_s": 13.23,
+      "throughput_samples_per_s": 2267.9,
+      "test_accuracy": 0.814
+    },
+    "512": {
+      "training_time_3ep_s": 13.57,
+      "throughput_samples_per_s": 2210.6,
+      "test_accuracy": 0.8233
+    },
+    "config": {
+      "target_batch_size": 1024,
+      "hardware_batch_size": 256,
+      "gradient_accumulation_steps": 4,
+      "prefetch_buffer_size": -1,
+      "num_parallel_calls": -1,
+      "use_caching": true,
+      "shuffle_buffer_size": 10000,
+      "steps_per_execution": 10
+    }
+  },
+  "knowledge_distillation": {
+    "teacher_params": 751418,
+    "student_params": 324394,
+    "compression_ratio": 2.32,
+    "teacher_test_accuracy": 0.7899,
+    "student_test_accuracy": 0.8076,
+    "student_history": {
+      "loss": [
+        0.084,
+        0.0542,
+        0.0427,
+        0.0346,
+        0.0336,
+        0.0294,
+        0.0278,
+        0.0295,
+        0.0266,
+        0.023
+      ],
+      "accuracy": [
+        0.9179,
+        0.9444,
+        0.9564,
+        0.9684,
+        0.9701,
+        0.9741,
+        0.975,
+        0.973,
+        0.9757,
+        0.982
+      ],
+      "val_loss": [
+        0.8529,
+        0.8444,
+        0.6771,
+        0.7265,
+        1.0164,
+        0.765,
+        1.02,
+        1.1032,
+        0.9884,
+        0.8775
+      ],
+      "val_accuracy": [
+        0.7862,
+        0.7833,
+        0.8279,
+        0.8259,
+        0.7707,
+        0.8111,
+        0.7878,
+        0.7671,
+        0.7922,
+        0.8076
+      ]
+    }
+  }
+}

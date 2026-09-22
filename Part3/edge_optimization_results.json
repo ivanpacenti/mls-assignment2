@@ -1,0 +1,155 @@
+{
+  "baseline": {
+    "params": 324394,
+    "test_accuracy": 0.8299,
+    "model_size_mb": 1.24
+  },
+  "pruning": {
+    "sparsity_50": {
+      "target_sparsity": 0.5,
+      "actual_sparsity": 0.4961,
+      "test_accuracy": 0.8375,
+      "params": 324394,
+      "non_zero_params": 163450
+    },
+    "sparsity_75": {
+      "target_sparsity": 0.75,
+      "actual_sparsity": 0.7442,
+      "test_accuracy": 0.821,
+      "params": 324394,
+      "non_zero_params": 82977
+    },
+    "sparsity_90": {
+      "target_sparsity": 0.9,
+      "actual_sparsity": 0.893,
+      "test_accuracy": 0.702,
+      "params": 324394,
+      "non_zero_params": 34695
+    }
+  },
+  "quantization": {
+    "dynamic_range": {
+      "path": "/Users/ivan/PycharmProjects/mls-assignment2/Part3/edge_optimized_models/model_dynamic_range.tflite",
+      "size_kb": 334.6,
+      "accuracy": 0.832,
+      "bits": 8,
+      "note": "weights int8, activations float32 runtime"
+    },
+    "float16": {
+      "path": "/Users/ivan/PycharmProjects/mls-assignment2/Part3/edge_optimized_models/model_float16.tflite",
+      "size_kb": 639.8,
+      "accuracy": 0.8335,
+      "bits": 16,
+      "note": "weights float16, activations float16"
+    },
+    "int8": {
+      "path": "/Users/ivan/PycharmProjects/mls-assignment2/Part3/edge_optimized_models/model_int8.tflite",
+      "size_kb": 341.4,
+      "accuracy": 0.8355,
+      "bits": 8,
+      "note": "weights + activations int8, requires calibration"
+    }
+  },
+  "architecture": {
+    "params": 35501,
+    "test_accuracy": 0.7183,
+    "compression_vs_baseline": 9.14,
+    "model_size_mb": 0.14
+  },
+  "nas": {
+    "candidates": [
+      {
+        "id": 0,
+        "widths": [
+          32,
+          64,
+          128
+        ],
+        "kernel": 5,
+        "params": 22837,
+        "test_accuracy": 0.243,
+        "training_time_s": 35.69
+      },
+      {
+        "id": 1,
+        "widths": [
+          16,
+          32,
+          64
+        ],
+        "kernel": 3,
+        "params": 8437,
+        "test_accuracy": 0.442,
+        "training_time_s": 18.22
+      },
+      {
+        "id": 2,
+        "widths": [
+          32,
+          64,
+          128
+        ],
+        "kernel": 5,
+        "params": 22837,
+        "test_accuracy": 0.2615,
+        "training_time_s": 35.25
+      }
+    ],
+    "best": {
+      "id": 1,
+      "widths": [
+        16,
+        32,
+        64
+      ],
+      "kernel": 3,
+      "params": 8437,
+      "test_accuracy": 0.442,
+      "training_time_s": 18.22
+    }
+  },
+  "tflite_conversions": {
+    "baseline_tflite": {
+      "path": "/Users/ivan/PycharmProjects/mls-assignment2/Part3/edge_optimized_models/baseline_tflite.tflite",
+      "size_kb": 334.6,
+      "latency_ms": 0.23,
+      "accuracy": 0.832
+    },
+    "architecture_opt": {
+      "path": "/Users/ivan/PycharmProjects/mls-assignment2/Part3/edge_optimized_models/architecture_opt.tflite",
+      "size_kb": 58.2,
+      "latency_ms": 0.1,
+      "accuracy": 0.722
+    }
+  },
+  "deployment_viability": {
+    "raspberry_pi_4": {
+      "fits_in_ram": true,
+      "fits_in_flash": true,
+      "viable": true,
+      "best_model_size_kb": 334.6,
+      "power_budget_mw": 5000
+    },
+    "jetson_nano": {
+      "fits_in_ram": true,
+      "fits_in_flash": true,
+      "viable": true,
+      "best_model_size_kb": 334.6,
+      "power_budget_mw": 10000
+    },
+    "esp32": {
+      "fits_in_ram": true,
+      "fits_in_flash": true,
+      "viable": true,
+      "best_model_size_kb": 334.6,
+      "power_budget_mw": 500
+    },
+    "arduino_nano_33_ble": {
+      "fits_in_ram": false,
+      "fits_in_flash": true,
+      "viable": false,
+      "best_model_size_kb": 334.6,
+      "power_budget_mw": 50
+    }
+  }
+}

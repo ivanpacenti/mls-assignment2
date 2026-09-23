@@ -10,7 +10,6 @@ Strategies implemented:
     3. Batch processing optimization (gradient accumulation + tf.data pipeline)
     4. Knowledge distillation (teacher -> student)
 
-Follows the exact class/method structure specified in the assignment.
 """
 
 import tensorflow as tf
@@ -61,19 +60,18 @@ class CloudOptimizer:
         mixed_precision.set_global_policy('mixed_float16')
         print(f"[Mixed Precision] Global policy → {mixed_precision.global_policy()}")
 
-        # Ricostruisci il modello DA ZERO con la nuova policy
-        # (non usare from_config perché non eredita la policy)
+        # i clone the model to avoid modifying the original baseline model
         mp_model = tf.keras.models.clone_model(self.baseline_model)
 
-        # Forza ogni layer ad usare la policy corrente
+        # force each layer to use the current policy (mixed_float16)
         for layer in mp_model.layers:
             if hasattr(layer, 'dtype_policy'):
                 layer.dtype_policy = mixed_precision.Policy('mixed_float16')
 
-        # Output layer resta float32 per stabilità
+        # Output layer stays float32 for stability
         mp_model.layers[-1].dtype_policy = mixed_precision.Policy('float32')
 
-        # Copia pesi
+        # Copy weights
         mp_model.set_weights(self.baseline_model.get_weights())
 
         mp_model.compile(
@@ -170,7 +168,7 @@ class CloudOptimizer:
         print("=" * 60)
 
         # Hardware-friendly batch size (per step); if target is bigger,
-        # we accumulate gradients over multiple micro-batches.
+        # I accumulate gradients over multiple micro-batches.
         hardware_batch = min(target_batch_size, 256)
         accumulation_steps = max(1, target_batch_size // hardware_batch)
 
@@ -182,7 +180,7 @@ class CloudOptimizer:
             'num_parallel_calls': tf.data.AUTOTUNE,
             'use_caching': True,
             'shuffle_buffer_size': 10000,
-            'steps_per_execution': 10,  # speeds up small models
+            'steps_per_execution': 10,
         }
 
         print(f"[Batch Processing] Hardware batch: {hardware_batch}")

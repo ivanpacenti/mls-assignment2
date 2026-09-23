@@ -5,14 +5,13 @@ This module implements a baseline CNN for CIFAR-10 classification that will serv
 as the starting point for optimization across different deployment targets (cloud,
 edge, and microcontroller).
 
-The model is intentionally over-parameterized to demonstrate optimization potential.
 """
-
+import os
+os.environ.setdefault('TF_USE_LEGACY_KERAS', '0')
 import tensorflow as tf
 from tensorflow import keras
 import numpy as np
 import time
-import os
 import json
 
 
@@ -126,7 +125,7 @@ def load_and_preprocess_data():
     ], name='data_augmentation')
 
     # Apply augmentation to generate additional training samples
-    # (We generate one augmented copy to double the training set)
+    # (I generate one augmented copy to double the training set)
     print("[Data] Applying data augmentation...")
     x_train_aug = data_augmentation(x_train, training=True).numpy()
 

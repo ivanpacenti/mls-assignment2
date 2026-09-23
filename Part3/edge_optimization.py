@@ -10,17 +10,28 @@ Strategies implemented:
     4. Simplified Neural Architecture Search (NAS)
     5. TensorFlow Lite conversion with metadata
 
-Follows the exact class/method structure specified in the assignment.
 """
+import json
+import os
+import time
+
+os.environ['TF_USE_LEGACY_KERAS'] = '0'
 
 import tensorflow as tf
-import tensorflow_model_optimization as tfmot
+import keras
 import numpy as np
-import time
-import json
 
-import os
-os.environ['KERAS_HOME'] = os.path.expanduser('~/.keras')
+# Import tfmot (this may redirect tf.keras to tf_keras/Keras 2)
+import tensorflow_model_optimization as tfmot
+
+# 🔑 FORCE tf.keras back to Keras 3
+import sys
+tf.keras = keras
+sys.modules['tf.keras'] = keras
+
+# Verify
+print(f"[Setup] tf.keras is now: {tf.keras.__name__}")
+print(f"[Setup] Keras version: {keras.__version__}")
 
 # Note: vitis_quantize is Xilinx-specific (for FPGA DPU deployment).
 # Import is kept for structural fidelity with the assignment template,
@@ -95,47 +106,6 @@ def load_cifar10_cached():
     return (x_train, y_train), (x_test, y_test)
 
 
-def load_keras_model_compat(path):
-    """
-    Load a Keras model saved with either Keras 2 or Keras 3.
-    Handles the `batch_shape` -> `shape` rename in InputLayer config,
-    which causes failures when loading Keras 2 models in Keras 3.
-    """
-    import zipfile
-    import json
-    import tempfile
-    import shutil
-
-    tmp_dir = tempfile.mkdtemp()
-    tmp_path = os.path.join(tmp_dir, 'patched.keras')
-
-    with zipfile.ZipFile(path, 'r') as zin:
-        with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED) as zout:
-            for item in zin.namelist():
-                data = zin.read(item)
-                if item == 'config.json':
-                    config = json.loads(data)
-                    config = _fix_batch_shape(config)
-                    data = json.dumps(config).encode('utf-8')
-                zout.writestr(item, data)
-
-    try:
-        model = tf.keras.models.load_model(tmp_path)
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    return model
-
-
-def _fix_batch_shape(obj):
-    """Recursively replace 'batch_shape' with 'shape' in Keras config dicts."""
-    if isinstance(obj, dict):
-        if 'batch_shape' in obj and 'shape' not in obj:
-            obj['shape'] = obj.pop('batch_shape')
-        return {k: _fix_batch_shape(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [_fix_batch_shape(item) for item in obj]
-    return obj
 class EdgeOptimizer:
     """
     Edge-side optimizer providing five orthogonal optimization strategies.
@@ -146,128 +116,164 @@ class EdgeOptimizer:
     def __init__(self, baseline_model_path):
         print(f"[EdgeOptimizer] Loading baseline from: {baseline_model_path}")
         self.baseline_model_path = baseline_model_path
-
-        # Try the compatibility loader first (handles Keras 2 vs 3 mismatch)
-        try:
-            self.baseline_model = load_keras_model_compat(baseline_model_path)
-            print("[EdgeOptimizer] Loaded via compatibility loader ✓")
-        except Exception as e:
-            print(f"[EdgeOptimizer] Compat loader failed: {e}")
-            print("[EdgeOptimizer] Falling back to rebuild approach...")
-            self.baseline_model = self._rebuild_baseline()
-            try:
-                self.baseline_model.load_weights(baseline_model_path)
-                print("[EdgeOptimizer] Weights loaded via load_weights()")
-            except Exception as e2:
-                print(f"[EdgeOptimizer] Weight load also failed: {e2}")
-                raise
-
+        self.baseline_model = tf.keras.models.load_model(baseline_model_path)
         print(f"[EdgeOptimizer] Baseline loaded — "
               f"params: {self.baseline_model.count_params():,}")
 
-    def _rebuild_baseline(self):
-        """Rebuild the baseline architecture exactly as in Part 1."""
-        model = tf.keras.Sequential([
-            tf.keras.layers.Input(shape=(32, 32, 3)),
-
-            # Block 1
-            tf.keras.layers.Conv2D(32, (3, 3), padding='same'),
-            tf.keras.layers.BatchNormalization(),
-            tf.keras.layers.ReLU(),
-            tf.keras.layers.Conv2D(32, (3, 3), padding='same'),
-            tf.keras.layers.BatchNormalization(),
-            tf.keras.layers.ReLU(),
-            tf.keras.layers.MaxPooling2D((2, 2)),
-
-            # Block 2
-            tf.keras.layers.Conv2D(64, (3, 3), padding='same'),
-            tf.keras.layers.BatchNormalization(),
-            tf.keras.layers.ReLU(),
-            tf.keras.layers.Conv2D(64, (3, 3), padding='same'),
-            tf.keras.layers.BatchNormalization(),
-            tf.keras.layers.ReLU(),
-            tf.keras.layers.MaxPooling2D((2, 2)),
-
-            # Block 3
-            tf.keras.layers.Conv2D(128, (3, 3), padding='same'),
-            tf.keras.layers.BatchNormalization(),
-            tf.keras.layers.ReLU(),
-            tf.keras.layers.Conv2D(128, (3, 3), padding='same'),
-            tf.keras.layers.BatchNormalization(),
-            tf.keras.layers.ReLU(),
-            tf.keras.layers.MaxPooling2D((2, 2)),
-
-            # Classifier
-            tf.keras.layers.GlobalAveragePooling2D(),
-            tf.keras.layers.Dropout(0.5),
-            tf.keras.layers.Dense(256, activation='relu'),
-            tf.keras.layers.Dropout(0.3),
-            tf.keras.layers.Dense(10, activation='softmax'),
-        ], name='baseline_cnn')
-
-        model.compile(
-            optimizer='adam',
-            loss='sparse_categorical_crossentropy',
-            metrics=['accuracy']
-        )
-        return model
 
     # =================================================================
     # 1. MAGNITUDE-BASED PRUNING
     # =================================================================
+    def _load_baseline_manually(self):
+        """
+        Manually rebuild the baseline model from the .keras archive.
+
+        Reads the config.json, extracts layer configs, and builds the model
+        layer-by-layer in Keras 2 (tf_keras). This bypasses the
+        load_model() incompatibility between TF 2.21's tf_keras and older
+        Keras 2 files.
+        """
+        import zipfile
+        import json
+        import tempfile
+        import h5py
+        import tf_keras
+
+        path = self.baseline_model_path
+
+        # -------------------------------------------------------------
+        # 1. Extract config.json
+        # -------------------------------------------------------------
+        with zipfile.ZipFile(path, 'r') as z:
+            config = json.loads(z.read('config.json'))
+
+        # Extract layer configs
+        layers_config = config['config']['layers']
+
+        # -------------------------------------------------------------
+        # 2. Build model layer-by-layer in Keras 2
+        # -------------------------------------------------------------
+        model_v2 = tf_keras.Sequential()
+
+        for layer_cfg in layers_config:
+            class_name = layer_cfg['class_name']
+            cfg = layer_cfg['config']
+
+            if class_name == 'InputLayer':
+                # Handle both 'shape' and 'batch_shape'
+                shape = cfg.get('shape', cfg.get('batch_shape'))
+                # Strip batch dimension
+                input_shape = tuple(shape[1:]) if shape else (32, 32, 3)
+                model_v2.add(tf_keras.layers.InputLayer(
+                    input_shape=input_shape,
+                    name=cfg.get('name')
+                ))
+            elif class_name == 'Conv2D':
+                model_v2.add(tf_keras.layers.Conv2D(
+                    filters=cfg['filters'],
+                    kernel_size=cfg['kernel_size'],
+                    strides=cfg.get('strides', (1, 1)),
+                    padding=cfg.get('padding', 'valid'),
+                    activation=cfg.get('activation'),
+                    use_bias=cfg.get('use_bias', True),
+                    name=cfg.get('name')
+                ))
+            elif class_name == 'BatchNormalization':
+                model_v2.add(tf_keras.layers.BatchNormalization(
+                    momentum=cfg.get('momentum', 0.99),
+                    epsilon=cfg.get('epsilon', 0.001),
+                    name=cfg.get('name')
+                ))
+            elif class_name == 'ReLU':
+                model_v2.add(tf_keras.layers.ReLU(
+                    max_value=cfg.get('max_value'),
+                    name=cfg.get('name')
+                ))
+            elif class_name == 'MaxPooling2D':
+                model_v2.add(tf_keras.layers.MaxPooling2D(
+                    pool_size=cfg.get('pool_size', (2, 2)),
+                    strides=cfg.get('strides'),
+                    padding=cfg.get('padding', 'valid'),
+                    name=cfg.get('name')
+                ))
+            elif class_name == 'GlobalAveragePooling2D':
+                model_v2.add(tf_keras.layers.GlobalAveragePooling2D(
+                    name=cfg.get('name')
+                ))
+            elif class_name == 'Dropout':
+                model_v2.add(tf_keras.layers.Dropout(
+                    rate=cfg['rate'],
+                    name=cfg.get('name')
+                ))
+            elif class_name == 'Dense':
+                model_v2.add(tf_keras.layers.Dense(
+                    units=cfg['units'],
+                    activation=cfg.get('activation'),
+                    use_bias=cfg.get('use_bias', True),
+                    name=cfg.get('name')
+                ))
+            else:
+                print(f"[Warning] Unknown layer: {class_name}")
+
+        # -------------------------------------------------------------
+        # 3. Copy weights from the Keras 3 model directly
+        # -------------------------------------------------------------
+        # The Keras 3 baseline_model already has the trained weights!
+        # No need to read the .keras archive manually.
+        try:
+            model_v2.set_weights(self.baseline_model.get_weights())
+            print("[Pruning] Weights copied from Keras 3 baseline")
+        except Exception as e:
+            print(f"[Pruning] Weight copy failed: {e}")
+
+        return model_v2
+
     def implement_pruning(self, target_sparsity=0.75, fine_tune_epochs=5):
-        """
-        Implement magnitude-based pruning for edge deployment.
-
-        Strategy:
-            - Wrap the model with `prune_low_magnitude`
-            - Use PolynomialDecay schedule from 0% to target_sparsity
-            - Fine-tune to recover accuracy
-            - Strip pruning wrappers → smaller Keras model
-
-        Args:
-            target_sparsity: Target sparsity level (0.75 = 75% weights pruned)
-            fine_tune_epochs: Number of fine-tuning epochs
-
-        Returns:
-            tf.keras.Model: Pruned model
-        """
         print("\n" + "=" * 60)
         print(f"[Pruning] Magnitude-based pruning @ {target_sparsity*100:.0f}% sparsity")
         print("=" * 60)
 
-        # Define pruning schedule: gradual sparsity increase over training
-        pruning_schedule = tfmot.sparsity.keras.PolynomialDecay(
-            initial_sparsity=0.0,
-            final_sparsity=target_sparsity,
-            begin_step=0,
-            end_step=1000
-        )
+        import tf_keras
 
-        # Wrap model with pruning — IMPORTANT: clone to avoid mutating self.baseline_model
-        import copy
-        baseline_copy = tf.keras.models.clone_model(self.baseline_model)
-        baseline_copy.set_weights(self.baseline_model.get_weights())
+        # -------------------------------------------------------------
+        # Manually rebuild the baseline in Keras 2
+        # -------------------------------------------------------------
+        print("[Pruning] Manually rebuilding baseline in Keras 2...")
+        baseline_v2 = self._load_baseline_manually()
+        print(f"[Pruning] Keras 2 model: {baseline_v2.count_params():,} params")
 
-        model_for_pruning = tfmot.sparsity.keras.prune_low_magnitude(
-            baseline_copy,  # ← usa la copia!
-            pruning_schedule=pruning_schedule
-        )
-
-        model_for_pruning.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=5e-4),
-            loss='sparse_categorical_crossentropy',
-            metrics=['accuracy']
-        )
-
-        # Load data
+        # Verify accuracy
         (x_train, y_train), (x_test, y_test) = load_cifar10_cached()
         x_train = x_train.astype('float32') / 255.0
         x_test = x_test.astype('float32') / 255.0
         y_train = y_train.flatten().astype('int32')
         y_test = y_test.flatten().astype('int32')
 
-        # Callbacks: pruning step + checkpoint logging
+        baseline_v2.compile(
+            optimizer=tf_keras.optimizers.Adam(learning_rate=5e-4),
+            loss='sparse_categorical_crossentropy',
+            metrics=['accuracy']
+        )
+        _, base_acc = baseline_v2.evaluate(x_test, y_test, verbose=0)
+        print(f"[Pruning] Keras 2 baseline accuracy: {base_acc:.4f}")
+
+        # -------------------------------------------------------------
+        # Apply pruning
+        # -------------------------------------------------------------
+        pruning_schedule = tfmot.sparsity.keras.PolynomialDecay(
+            initial_sparsity=0.0, final_sparsity=target_sparsity,
+            begin_step=0, end_step=1000
+        )
+
+        model_for_pruning = tfmot.sparsity.keras.prune_low_magnitude(
+            baseline_v2, pruning_schedule=pruning_schedule
+        )
+        model_for_pruning.compile(
+            optimizer=tf_keras.optimizers.Adam(learning_rate=5e-4),
+            loss='sparse_categorical_crossentropy',
+            metrics=['accuracy']
+        )
+
         log_dir = os.path.join(SCRIPT_DIR, 'pruning_logs')
         os.makedirs(log_dir, exist_ok=True)
 
@@ -276,7 +282,6 @@ class EdgeOptimizer:
             tfmot.sparsity.keras.PruningSummaries(log_dir=log_dir)
         ]
 
-        # Fine-tune
         print(f"[Pruning] Fine-tuning for {fine_tune_epochs} epochs...")
         model_for_pruning.fit(
             x_train, y_train,
@@ -287,21 +292,18 @@ class EdgeOptimizer:
             verbose=1
         )
 
-        # Strip pruning wrappers so model is deployment-ready
-        model_pruned = tfmot.sparsity.keras.strip_pruning(model_for_pruning)
-        model_pruned.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
+        model_pruned_v2 = tfmot.sparsity.keras.strip_pruning(model_for_pruning)
+        model_pruned_v2.compile(
+            optimizer=tf_keras.optimizers.Adam(learning_rate=1e-4),
             loss='sparse_categorical_crossentropy',
             metrics=['accuracy']
         )
-
-        # Evaluate
-        loss, accuracy = model_pruned.evaluate(x_test, y_test, verbose=0)
+        loss, accuracy = model_pruned_v2.evaluate(x_test, y_test, verbose=0)
 
         # Compute actual sparsity
         total_weights = 0
         zero_weights = 0
-        for w in model_pruned.weights:
+        for w in model_pruned_v2.weights:
             total_weights += int(tf.size(w).numpy())
             zero_weights += int(tf.math.count_nonzero(tf.equal(w, 0)).numpy())
 
@@ -309,11 +311,24 @@ class EdgeOptimizer:
 
         print(f"[Pruning] Test accuracy: {accuracy:.4f}")
         print(f"[Pruning] Actual sparsity: {actual_sparsity*100:.2f}%")
-        print(f"[Pruning] Zero weights: {zero_weights:,} / {total_weights:,}")
+
+        # Convert pruned model back to Keras 3 for downstream use
+        # Save Keras 2 model as .h5, reload with Keras 3
+        tmp_h5 = os.path.join(log_dir, 'temp_pruned.h5')
+        model_pruned_v2.save(tmp_h5)
+
+        # Load with Keras 3 (HDF5 format is more portable)
+        model_pruned = tf.keras.models.load_model(tmp_h5, compile=False)
+
+        # Recompile with proper loss/metric objects (Keras 3 needs callables)
+        model_pruned.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
+            loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+            metrics=[tf.keras.metrics.SparseCategoricalAccuracy()]
+        )
+        print(f"[Pruning] Reloaded in Keras 3: {model_pruned.count_params():,} params")
 
         return model_pruned
-
-    # =================================================================
     # 2. POST-TRAINING QUANTIZATION
     # =================================================================
     def implement_quantization(self):
@@ -335,10 +350,9 @@ class EdgeOptimizer:
         quantized_models = {}
 
         # Load data for calibration and evaluation
-        (x_train, y_train), (x_test, y_test) = load_cifar10_cached()
+        (x_train, _), (x_test, y_test) = load_cifar10_cached()
         x_train = x_train.astype('float32') / 255.0
         x_test = x_test.astype('float32') / 255.0
-        y_train = y_train.flatten().astype('int32')
         y_test = y_test.flatten().astype('int32')
 
         # Representative dataset for INT8 calibration
@@ -478,7 +492,7 @@ class EdgeOptimizer:
                 correct += 1
 
         return correct / total
-        # =================================================================
+    # =================================================================
     # 3. ARCHITECTURE OPTIMIZATION
     # =================================================================
     def implement_architecture_optimization(self):
@@ -823,6 +837,7 @@ def benchmark_edge_optimizations():
     print(f"[Baseline] Params: {baseline_params:,}, "
           f"acc: {baseline_acc:.4f}")
 
+
     # -----------------------------------------------------------------
     # 1. PRUNING at multiple sparsity levels
     # -----------------------------------------------------------------
@@ -832,7 +847,7 @@ def benchmark_edge_optimizations():
 
     pruning_results = {}
     for sparsity in [0.5, 0.75, 0.9]:
-        print(f"\n[Pruning] Target sparsity: {sparsity*100:.0f}%")
+        print(f"\n[Pruning] Target sparsity: {sparsity * 100:.0f}%")
         try:
             model = optimizer.implement_pruning(
                 target_sparsity=sparsity,
@@ -840,7 +855,6 @@ def benchmark_edge_optimizations():
             )
             _, acc = model.evaluate(x_test, y_test, verbose=0)
 
-            # Compute actual sparsity
             total_w, zero_w = 0, 0
             for w in model.weights:
                 total_w += int(tf.size(w).numpy())
@@ -848,19 +862,20 @@ def benchmark_edge_optimizations():
 
             actual_sparsity = zero_w / total_w if total_w > 0 else 0.0
 
-            pruning_results[f'sparsity_{int(sparsity*100)}'] = {
+            pruning_results[f'sparsity_{int(sparsity * 100)}'] = {
                 'target_sparsity': sparsity,
                 'actual_sparsity': round(float(actual_sparsity), 4),
                 'test_accuracy': round(float(acc), 4),
                 'params': int(model.count_params()),
                 'non_zero_params': int(model.count_params() * (1 - actual_sparsity)),
             }
-            print(f"✓ Sparsity {sparsity*100:.0f}% — "
-                  f"acc: {acc:.4f}, actual: {actual_sparsity*100:.1f}%")
+            print(f"✓ Sparsity {sparsity * 100:.0f}% — "
+                  f"acc: {acc:.4f}, actual: {actual_sparsity * 100:.1f}%")
         except Exception as e:
             print(f"✗ Pruning @ {sparsity} failed: {e}")
-            import traceback; traceback.print_exc()
-            pruning_results[f'sparsity_{int(sparsity*100)}'] = {'error': str(e)}
+            import traceback;
+            traceback.print_exc()
+            pruning_results[f'sparsity_{int(sparsity * 100)}'] = {'error': str(e)}
 
     results['pruning'] = pruning_results
 

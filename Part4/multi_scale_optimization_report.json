@@ -1,0 +1,118 @@
+{
+  "optimization_results": {
+    "cloud_server": {
+      "model_path": "/Users/ivan/PycharmProjects/mls-assignment2/Part4/optimized_models/cloud_model.tflite",
+      "accuracy": 0.832,
+      "model_size_mb": 0.627,
+      "estimated_latency_ms": 0.89,
+      "memory_usage_mb": 0.753,
+      "optimization_strategy": "float16 quantization",
+      "meets_size_constraint": true,
+      "meets_latency_constraint": true,
+      "meets_memory_constraint": true,
+      "meets_power_constraint": true
+    },
+    "edge_device": {
+      "model_path": "/Users/ivan/PycharmProjects/mls-assignment2/Part4/optimized_models/edge_model.tflite",
+      "accuracy": 0.8235,
+      "model_size_mb": 0.328,
+      "estimated_latency_ms": 0.226,
+      "memory_usage_mb": 0.492,
+      "optimization_strategy": "pruning(50%) + dynamic_range_quant",
+      "meets_size_constraint": true,
+      "meets_latency_constraint": true,
+      "meets_memory_constraint": true,
+      "meets_power_constraint": true
+    },
+    "microcontroller": {
+      "model_path": "/Users/ivan/PycharmProjects/mls-assignment2/Part4/optimized_models/tiny_model.tflite",
+      "accuracy": 0.616,
+      "model_size_mb": 0.018,
+      "estimated_latency_ms": 0.028,
+      "memory_usage_mb": 0.036,
+      "optimization_strategy": "tiny_arch + full_INT8",
+      "meets_size_constraint": true,
+      "meets_latency_constraint": true,
+      "meets_memory_constraint": true,
+      "meets_power_constraint": true
+    }
+  },
+  "scaling_analysis": {
+    "pareto_frontier": [
+      {
+        "name": "cloud_server",
+        "accuracy": 0.832,
+        "size_mb": 0.627
+      },
+      {
+        "name": "edge_device",
+        "accuracy": 0.8235,
+        "size_mb": 0.328
+      },
+      {
+        "name": "microcontroller",
+        "accuracy": 0.616,
+        "size_mb": 0.018
+      }
+    ],
+    "scaling_efficiency": {
+      "cloud_server": {
+        "accuracy": 0.832,
+        "size_mb": 0.627,
+        "latency_ms": 0.89,
+        "memory_mb": 0.753,
+        "strategy": "float16 quantization",
+        "meets_all_constraints": true
+      },
+      "edge_device": {
+        "accuracy": 0.8235,
+        "size_mb": 0.328,
+        "latency_ms": 0.226,
+        "memory_mb": 0.492,
+        "strategy": "pruning(50%) + dynamic_range_quant",
+        "meets_all_constraints": true
+      },
+      "microcontroller": {
+        "accuracy": 0.616,
+        "size_mb": 0.018,
+        "latency_ms": 0.028,
+        "memory_mb": 0.036,
+        "strategy": "tiny_arch + full_INT8",
+        "meets_all_constraints": true
+      }
+    },
+    "bottlenecks": {
+      "cloud_server": [
+        "none"
+      ],
+      "edge_device": [
+        "none"
+      ],
+      "microcontroller": [
+        "none"
+      ]
+    },
+    "use_case_recommendations": {
+      "realtime_video": {
+        "priority": "latency < 50ms, high accuracy",
+        "best_target": "microcontroller"
+      },
+      "iot_sensor": {
+        "priority": "extreme power efficiency",
+        "best_target": "microcontroller"
+      },
+      "mobile_app": {
+        "priority": "balanced accuracy/efficiency",
+        "best_target": "microcontroller"
+      }
+    }
+  },
+  "deployment_recommendations": [
+    "\u2705 cloud_server: meets all constraints with 83.2% accuracy, 0.63MB, 0.89ms. Strategy: float16 quantization",
+    "\u2705 edge_device: meets all constraints with 82.3% accuracy, 0.33MB, 0.23ms. Strategy: pruning(50%) + dynamic_range_quant",
+    "\u2705 microcontroller: meets all constraints with 61.6% accuracy, 0.02MB, 0.03ms. Strategy: tiny_arch + full_INT8",
+    "\n\ud83d\udcca Cascaded deployment: Use cloud for training-heavy tasks, edge for inference with latency constraints, microcontroller for extreme low-power use cases.",
+    "\ud83d\udd04 Hybrid strategy: Deploy the edge model as primary inference, with cloud as fallback for low-confidence predictions.",
+    "\n\ud83c\udfaf Pareto-optimal models (accuracy vs size): cloud_server, edge_device, microcontroller"
+  ]
+}

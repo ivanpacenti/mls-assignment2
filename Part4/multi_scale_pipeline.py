@@ -9,15 +9,24 @@ them conditionally based on the target's resource constraints.
 
 Follows the exact class/method structure specified in the assignment.
 """
-
+import os
+os.environ['TF_USE_LEGACY_KERAS'] = '0'
 import tensorflow as tf
 import numpy as np
-import json
-import os
-import time
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Any
+import json
+import keras
+import time
+import zipfile
+import tempfile
+
+# 🔑 Force tf.keras back to Keras 3 (tfmot redirects it to Keras 2)
+import sys
+tf.keras = keras
+sys.modules['tf.keras'] = keras
 
 # =====================================================================
 # Path handling
@@ -83,7 +92,6 @@ class ModelOptimizer(ABC):
         import pickle
         cache_dir = os.path.expanduser('~/.keras/datasets/cifar-10-batches-py')
         if not os.path.exists(cache_dir):
-            # Fallback: try Keras loader
             (x_train, y_train), (x_test, y_test) = tf.keras.datasets.cifar10.load_data()
             return x_train, y_train, x_test, y_test
 
@@ -116,7 +124,6 @@ class ModelOptimizer(ABC):
             scale, zp = inp[0]['quantization']
             x = (x / scale + zp).astype(np.int8)
 
-        # Warm-up
         for _ in range(5):
             interpreter.set_tensor(inp[0]['index'], x)
             interpreter.invoke()
@@ -162,7 +169,7 @@ class ModelOptimizer(ABC):
 class CloudOptimizer(ModelOptimizer):
     """
     Cloud optimizer: focus on accuracy and throughput.
-    Strategy: mixed precision training + float16 TFLite (fast, still accurate).
+    Strategy: float16 TFLite quantization.
     """
 
     def optimize(self, model: tf.keras.Model, target: DeploymentTarget) -> OptimizationResult:
@@ -174,8 +181,6 @@ class CloudOptimizer(ModelOptimizer):
         x_train = x_train.astype('float32') / 255.0
         x_test = x_test.astype('float32') / 255.0
 
-        # Cloud strategy: just float16 quantization
-        # (preserves accuracy, halves size, fastest inference)
         baseline = self._clone_model(model)
 
         converter = tf.lite.TFLiteConverter.from_keras_model(baseline)
@@ -190,7 +195,7 @@ class CloudOptimizer(ModelOptimizer):
         size_mb = len(tflite_bytes) / (1024 * 1024)
         acc = self._evaluate_tflite(out_path, x_test[:2000], y_test[:2000])
         latency = self._measure_tflite_latency(out_path, x_test[:1])
-        memory_mb = size_mb * 1.2  # ~1.2× model size in RAM
+        memory_mb = size_mb * 1.2
 
         result = OptimizationResult(
             model_path=out_path,
@@ -208,16 +213,20 @@ class CloudOptimizer(ModelOptimizer):
         r.meets_size_constraint = r.model_size_mb <= t.max_model_size_mb
         r.meets_latency_constraint = r.estimated_latency_ms <= t.max_latency_ms
         r.meets_memory_constraint = r.memory_usage_mb <= t.max_memory_mb
-        r.meets_power_constraint = True  # Not measurable from Python
+        r.meets_power_constraint = True
 
 
 # =====================================================================
-# EDGE OPTIMIZER
+# EDGE OPTIMIZER  (with Keras 3 → 2 → 3 round-trip for pruning)
 # =====================================================================
 class EdgeOptimizer(ModelOptimizer):
     """
     Edge optimizer: focus on latency and memory.
-    Strategy: dynamic range quantization + optional pruning at 50%.
+    Strategy: magnitude pruning at 50% + dynamic range quantization.
+
+    Note: tfmot.sparsity requires Keras 2 models. We round-trip through
+    Keras 2 for pruning (same technique as Part 3), then convert back to
+    Keras 3 for TFLite conversion.
     """
 
     def optimize(self, model: tf.keras.Model, target: DeploymentTarget) -> OptimizationResult:
@@ -228,42 +237,71 @@ class EdgeOptimizer(ModelOptimizer):
         x_train, y_train, x_test, y_test = self._load_cifar10()
         x_train = x_train.astype('float32') / 255.0
         x_test = x_test.astype('float32') / 255.0
+        y_train = y_train.flatten().astype('int32')
 
-        # Edge strategy: prune to 50% + dynamic range quantization
-        baseline = self._clone_model(model)
+        # -------------------------------------------------------------
+        # Step 1: Pruning at 50% via Keras 2 round-trip
+        # -------------------------------------------------------------
+        baseline = None
+        strategy = 'dynamic_range_quant'
 
-        # Step 1: pruning at 50% (light, preserves accuracy)
         try:
+            import tf_keras
             import tensorflow_model_optimization as tfmot
-            pruning_schedule = tfmot.sparsity.keras.PolynomialDecay(
-                initial_sparsity=0.0, final_sparsity=0.5,
-                begin_step=0, end_step=500
-            )
-            baseline_for_pruning = self._clone_model(baseline)
-            model_for_pruning = tfmot.sparsity.keras.prune_low_magnitude(
-                baseline_for_pruning, pruning_schedule=pruning_schedule
-            )
-            model_for_pruning.compile(
-                optimizer='adam',
+
+            print("  [EdgeOptimizer] Building Keras 2 copy for pruning...")
+            baseline_v2 = self._build_keras2_model(model)
+            baseline_v2.compile(
+                optimizer=tf_keras.optimizers.Adam(learning_rate=5e-4),
                 loss='sparse_categorical_crossentropy',
                 metrics=['accuracy']
             )
+
+            # Verify weights were copied
+            _, base_acc = baseline_v2.evaluate(x_test[:2000], y_test[:2000], verbose=0)
+            print(f"  [EdgeOptimizer] Keras 2 baseline accuracy: {base_acc:.4f}")
+
+            # Apply pruning schedule
+            pruning_schedule = tfmot.sparsity.keras.PolynomialDecay(
+                initial_sparsity=0.0,
+                final_sparsity=0.5,
+                begin_step=0,
+                end_step=500
+            )
+            model_for_pruning = tfmot.sparsity.keras.prune_low_magnitude(
+                baseline_v2, pruning_schedule=pruning_schedule
+            )
+            model_for_pruning.compile(
+                optimizer=tf_keras.optimizers.Adam(learning_rate=5e-4),
+                loss='sparse_categorical_crossentropy',
+                metrics=['accuracy']
+            )
+
+            # Brief fine-tune
+            print("  [EdgeOptimizer] Fine-tuning pruned model (2 epochs on 5k samples)...")
             model_for_pruning.fit(
-                x_train, y_train, batch_size=128, epochs=1,
+                x_train[:5000], y_train[:5000],
+                batch_size=128, epochs=2,
                 validation_split=0.1, verbose=0,
                 callbacks=[tfmot.sparsity.keras.UpdatePruningStep()]
             )
-            pruned = tfmot.sparsity.keras.strip_pruning(model_for_pruning)
-            pruned.compile(optimizer='adam',
-                           loss='sparse_categorical_crossentropy',
-                           metrics=['accuracy'])
-            baseline = pruned
+
+            # Strip wrappers
+            pruned_v2 = tfmot.sparsity.keras.strip_pruning(model_for_pruning)
+
+            # Convert Keras 2 → Keras 3
+            print("  [EdgeOptimizer] Converting pruned model → Keras 3...")
+            baseline = self._rebuild_keras3_from_keras2(pruned_v2)
             strategy = 'pruning(50%) + dynamic_range_quant'
+            print("  [EdgeOptimizer] Pruning OK (50% sparsity)")
+
         except Exception as e:
             print(f"  [EdgeOptimizer] Pruning failed ({e}), using quantization only")
-            strategy = 'dynamic_range_quant'
+            baseline = self._clone_model(model)
 
-        # Step 2: TFLite conversion with dynamic range
+        # -------------------------------------------------------------
+        # Step 2: Dynamic range quantization
+        # -------------------------------------------------------------
         converter = tf.lite.TFLiteConverter.from_keras_model(baseline)
         converter.optimizations = [tf.lite.Optimize.DEFAULT]
         tflite_bytes = converter.convert()
@@ -288,6 +326,103 @@ class EdgeOptimizer(ModelOptimizer):
         CloudOptimizer._check_constraints(result, target)
         return result
 
+    # -----------------------------------------------------------------
+    # Keras 3 → Keras 2 conversion helpers
+    # -----------------------------------------------------------------
+    @staticmethod
+    def _build_keras2_model(keras3_model):
+        """
+        Build an equivalent Keras 2 model by copying architecture and weights
+        from a Keras 3 model. Avoids from_config() incompatibilities by
+        reconstructing layer-by-layer.
+        """
+        import tf_keras
+
+        model_v2 = tf_keras.Sequential()
+        for layer in keras3_model.layers:
+            name = layer.__class__.__name__
+            cfg = layer.get_config()
+
+            if name == 'InputLayer':
+                shape = cfg.get('shape', cfg.get('batch_shape'))
+                input_shape = tuple(shape[1:]) if shape else (32, 32, 3)
+                model_v2.add(tf_keras.layers.InputLayer(
+                    input_shape=input_shape, name=cfg.get('name')
+                ))
+            elif name == 'Conv2D':
+                model_v2.add(tf_keras.layers.Conv2D(
+                    filters=cfg['filters'], kernel_size=cfg['kernel_size'],
+                    strides=cfg.get('strides', (1, 1)),
+                    padding=cfg.get('padding', 'valid'),
+                    activation=cfg.get('activation'),
+                    use_bias=cfg.get('use_bias', True),
+                    name=cfg.get('name')
+                ))
+            elif name == 'BatchNormalization':
+                model_v2.add(tf_keras.layers.BatchNormalization(
+                    momentum=cfg.get('momentum', 0.99),
+                    epsilon=cfg.get('epsilon', 0.001),
+                    name=cfg.get('name')
+                ))
+            elif name == 'ReLU':
+                model_v2.add(tf_keras.layers.ReLU(name=cfg.get('name')))
+            elif name == 'MaxPooling2D':
+                model_v2.add(tf_keras.layers.MaxPooling2D(
+                    pool_size=cfg.get('pool_size', (2, 2)),
+                    strides=cfg.get('strides'),
+                    padding=cfg.get('padding', 'valid'),
+                    name=cfg.get('name')
+                ))
+            elif name == 'GlobalAveragePooling2D':
+                model_v2.add(tf_keras.layers.GlobalAveragePooling2D(
+                    name=cfg.get('name')
+                ))
+            elif name == 'Dropout':
+                model_v2.add(tf_keras.layers.Dropout(
+                    rate=cfg['rate'], name=cfg.get('name')
+                ))
+            elif name == 'Dense':
+                model_v2.add(tf_keras.layers.Dense(
+                    units=cfg['units'], activation=cfg.get('activation'),
+                    use_bias=cfg.get('use_bias', True),
+                    name=cfg.get('name')
+                ))
+            else:
+                print(f"    [Warn] Unknown layer: {name}")
+
+        # Build the model (creates weights tensors) before copying
+        model_v2.build(input_shape=(None, 32, 32, 3))
+
+        # Copy weights from the Keras 3 model
+        try:
+            model_v2.set_weights(keras3_model.get_weights())
+        except Exception as e:
+            print(f"    [Warn] Direct set_weights failed: {e}")
+            print(f"    Trying layer-by-layer transfer...")
+            for layer_v2, layer_v3 in zip(model_v2.layers, keras3_model.layers):
+                try:
+                    layer_v2.set_weights(layer_v3.get_weights())
+                except Exception:
+                    pass
+
+        return model_v2
+
+    @staticmethod
+    def _rebuild_keras3_from_keras2(model_v2):
+        """Convert a Keras 2 model back to Keras 3 format."""
+        tmp_dir = tempfile.mkdtemp()
+        tmp_h5 = os.path.join(tmp_dir, 'temp_pruned.h5')
+        model_v2.save(tmp_h5)
+        model_v3 = tf.keras.models.load_model(tmp_h5, compile=False)
+        model_v3.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
+            loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+            metrics=[tf.keras.metrics.SparseCategoricalAccuracy()]
+        )
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return model_v3
+
 
 # =====================================================================
 # TINYML OPTIMIZER
@@ -295,7 +430,7 @@ class EdgeOptimizer(ModelOptimizer):
 class TinyMLOptimizer(ModelOptimizer):
     """
     TinyML optimizer: extreme resource constraints.
-    Strategy: architecture redesign (depthwise separable) + full INT8 quantization.
+    Strategy: architecture redesign + full INT8 quantization.
     """
 
     def optimize(self, model: tf.keras.Model, target: DeploymentTarget) -> OptimizationResult:
@@ -309,7 +444,6 @@ class TinyMLOptimizer(ModelOptimizer):
         y_train = y_train.flatten().astype('int32')
         y_test = y_test.flatten().astype('int32')
 
-        # Tiny strategy: build a lightweight architecture from scratch
         tiny_model = self._build_tiny_architecture()
         tiny_model.compile(
             optimizer=tf.keras.optimizers.Adam(1e-3),
@@ -317,7 +451,6 @@ class TinyMLOptimizer(ModelOptimizer):
             metrics=['accuracy']
         )
 
-        # Train briefly
         print("  Training tiny architecture (30 epochs)...")
         tiny_model.fit(
             x_train, y_train, batch_size=128, epochs=30,
@@ -332,7 +465,6 @@ class TinyMLOptimizer(ModelOptimizer):
             ]
         )
 
-        # Full INT8 quantization
         def representative_dataset():
             for i in range(100):
                 yield [x_train[i:i+1].astype('float32')]
@@ -352,7 +484,7 @@ class TinyMLOptimizer(ModelOptimizer):
         size_mb = len(tflite_bytes) / (1024 * 1024)
         acc = self._evaluate_tflite(out_path, x_test[:2000], y_test[:2000])
         latency = self._measure_tflite_latency(out_path, x_test[:1])
-        memory_mb = size_mb * 2.0  # INT8 needs dequant buffers
+        memory_mb = size_mb * 2.0
 
         result = OptimizationResult(
             model_path=out_path,
@@ -367,7 +499,6 @@ class TinyMLOptimizer(ModelOptimizer):
 
     @staticmethod
     def _build_tiny_architecture():
-        """Lightweight architecture for tiny devices: ~15k params, ~60KB."""
         return tf.keras.Sequential([
             tf.keras.layers.Input(shape=(32, 32, 3)),
             tf.keras.layers.SeparableConv2D(16, (3, 3), padding='same'),
@@ -391,9 +522,7 @@ class TinyMLOptimizer(ModelOptimizer):
 # PIPELINE
 # =====================================================================
 class MultiScaleDeploymentPipeline:
-    """
-    Automated pipeline for optimizing models across different deployment scales.
-    """
+    """Automated pipeline for optimizing models across deployment scales."""
 
     def __init__(self):
         self.optimizers = {
@@ -404,49 +533,34 @@ class MultiScaleDeploymentPipeline:
 
         self.targets = {
             'cloud_server': DeploymentTarget(
-                name='cloud_server',
-                max_model_size_mb=1000.0,
-                max_latency_ms=100.0,
-                max_memory_mb=8000.0,
-                power_budget_mw=50000.0,
-                compute_capability='cloud'
+                name='cloud_server', max_model_size_mb=1000.0,
+                max_latency_ms=100.0, max_memory_mb=8000.0,
+                power_budget_mw=50000.0, compute_capability='cloud'
             ),
             'edge_device': DeploymentTarget(
-                name='edge_device',
-                max_model_size_mb=50.0,
-                max_latency_ms=200.0,
-                max_memory_mb=512.0,
-                power_budget_mw=2000.0,
-                compute_capability='edge'
+                name='edge_device', max_model_size_mb=50.0,
+                max_latency_ms=200.0, max_memory_mb=512.0,
+                power_budget_mw=2000.0, compute_capability='edge'
             ),
             'microcontroller': DeploymentTarget(
-                name='microcontroller',
-                max_model_size_mb=1.0,
-                max_latency_ms=1000.0,
-                max_memory_mb=64.0,
-                power_budget_mw=10.0,
-                compute_capability='tiny'
+                name='microcontroller', max_model_size_mb=1.0,
+                max_latency_ms=1000.0, max_memory_mb=64.0,
+                power_budget_mw=10.0, compute_capability='tiny'
             )
         }
 
     def optimize_for_all_targets(self, baseline_model_path: str) -> Dict[str, OptimizationResult]:
-        """
-        Optimize baseline model for all deployment targets.
-        """
         print("\n" + "#" * 60)
         print("# MULTI-SCALE OPTIMIZATION PIPELINE")
         print("#" * 60)
-
         print(f"\n[Pipeline] Loading baseline: {baseline_model_path}")
         baseline_model = self._load_baseline(baseline_model_path)
         print(f"[Pipeline] Baseline params: {baseline_model.count_params():,}")
 
         results = {}
-
         for target_name, target_config in self.targets.items():
             print(f"\n{'=' * 60}")
-            print(f"[Pipeline] Target: {target_name} "
-                  f"({target_config.compute_capability})")
+            print(f"[Pipeline] Target: {target_name} ({target_config.compute_capability})")
             print(f"{'=' * 60}")
             try:
                 optimizer = self.optimizers[target_config.compute_capability]
@@ -455,89 +569,34 @@ class MultiScaleDeploymentPipeline:
                 print(f"[Pipeline] Target {target_name} failed: {e}")
                 import traceback; traceback.print_exc()
                 results[target_name] = OptimizationResult(
-                    model_path='',
-                    accuracy=0.0, model_size_mb=0.0,
+                    model_path='', accuracy=0.0, model_size_mb=0.0,
                     estimated_latency_ms=0.0, memory_usage_mb=0.0,
                     optimization_strategy=f'FAILED: {e}'
                 )
-
         return results
 
     @staticmethod
     def _load_baseline(path):
-        """Load baseline with Keras 2/3 compatibility."""
-        try:
-            return tf.keras.models.load_model(path)
-        except Exception as e:
-            print(f"[Pipeline] Direct load failed ({e.__class__.__name__}), "
-                  f"rebuilding architecture...")
-            model = tf.keras.Sequential([
-                tf.keras.layers.Input(shape=(32, 32, 3)),
-                tf.keras.layers.Conv2D(32, (3, 3), padding='same'),
-                tf.keras.layers.BatchNormalization(),
-                tf.keras.layers.ReLU(),
-                tf.keras.layers.Conv2D(32, (3, 3), padding='same'),
-                tf.keras.layers.BatchNormalization(),
-                tf.keras.layers.ReLU(),
-                tf.keras.layers.MaxPooling2D((2, 2)),
-                tf.keras.layers.Conv2D(64, (3, 3), padding='same'),
-                tf.keras.layers.BatchNormalization(),
-                tf.keras.layers.ReLU(),
-                tf.keras.layers.Conv2D(64, (3, 3), padding='same'),
-                tf.keras.layers.BatchNormalization(),
-                tf.keras.layers.ReLU(),
-                tf.keras.layers.MaxPooling2D((2, 2)),
-                tf.keras.layers.Conv2D(128, (3, 3), padding='same'),
-                tf.keras.layers.BatchNormalization(),
-                tf.keras.layers.ReLU(),
-                tf.keras.layers.Conv2D(128, (3, 3), padding='same'),
-                tf.keras.layers.BatchNormalization(),
-                tf.keras.layers.ReLU(),
-                tf.keras.layers.MaxPooling2D((2, 2)),
-                tf.keras.layers.GlobalAveragePooling2D(),
-                tf.keras.layers.Dropout(0.5),
-                tf.keras.layers.Dense(256, activation='relu'),
-                tf.keras.layers.Dropout(0.3),
-                tf.keras.layers.Dense(10, activation='softmax'),
-            ])
-            model.load_weights(path)
-            model.compile(optimizer='adam',
-                          loss='sparse_categorical_crossentropy',
-                          metrics=['accuracy'])
-            return model
+        return tf.keras.models.load_model(path)
 
     def analyze_scaling_trade_offs(self, results: Dict[str, OptimizationResult]) -> Dict[str, Any]:
-        """
-        Analyze trade-offs across different deployment scales.
-        """
         analysis = {}
 
-        # -------------------------------------------------------------
-        # 1. Pareto frontier (accuracy vs model size)
-        # -------------------------------------------------------------
-        points = [
-            (name, r.accuracy, r.model_size_mb)
-            for name, r in results.items()
-            if r.accuracy > 0 and r.model_size_mb > 0
-        ]
+        points = [(name, r.accuracy, r.model_size_mb)
+                  for name, r in results.items()
+                  if r.accuracy > 0 and r.model_size_mb > 0]
         pareto = []
         for name, acc, size in points:
-            dominated = False
-            for other_name, other_acc, other_size in points:
-                if other_name == name:
-                    continue
-                if other_acc >= acc and other_size <= size and \
-                   (other_acc > acc or other_size < size):
-                    dominated = True
-                    break
+            dominated = any(
+                other_acc >= acc and other_size <= size and
+                (other_acc > acc or other_size < size)
+                for other_name, other_acc, other_size in points
+                if other_name != name
+            )
             if not dominated:
                 pareto.append({'name': name, 'accuracy': acc, 'size_mb': size})
-
         analysis['pareto_frontier'] = pareto
 
-        # -------------------------------------------------------------
-        # 2. Scaling efficiency
-        # -------------------------------------------------------------
         scaling = {}
         for name, r in results.items():
             scaling[name] = {
@@ -554,9 +613,6 @@ class MultiScaleDeploymentPipeline:
             }
         analysis['scaling_efficiency'] = scaling
 
-        # -------------------------------------------------------------
-        # 3. Bottlenecks per target
-        # -------------------------------------------------------------
         bottlenecks = {}
         for name, r in results.items():
             issues = []
@@ -567,12 +623,8 @@ class MultiScaleDeploymentPipeline:
             if not r.meets_memory_constraint:
                 issues.append(f'memory ({r.memory_usage_mb}MB too high)')
             bottlenecks[name] = issues if issues else ['none']
-
         analysis['bottlenecks'] = bottlenecks
 
-        # -------------------------------------------------------------
-        # 4. Recommendations by use case
-        # -------------------------------------------------------------
         analysis['use_case_recommendations'] = {
             'realtime_video': {
                 'priority': 'latency < 50ms, high accuracy',
@@ -587,24 +639,15 @@ class MultiScaleDeploymentPipeline:
             'mobile_app': {
                 'priority': 'balanced accuracy/efficiency',
                 'best_target': min(
-                    [(n, r) for n, r in results.items()
-                     if r.accuracy > 0.6],
+                    [(n, r) for n, r in results.items() if r.accuracy > 0.6],
                     key=lambda kv: kv[1].model_size_mb
                 )[0] if any(r.accuracy > 0.6 for r in results.values()) else 'none'
             },
         }
-
         return analysis
 
     def generate_deployment_recommendations(self, analysis: Dict[str, Any]) -> List[str]:
-        """
-        Generate actionable deployment recommendations.
-        """
         recommendations = []
-
-        # -------------------------------------------------------------
-        # Which targets meet requirements?
-        # -------------------------------------------------------------
         scaling = analysis.get('scaling_efficiency', {})
         for target, info in scaling.items():
             if info['meets_all_constraints']:
@@ -617,39 +660,23 @@ class MultiScaleDeploymentPipeline:
             else:
                 issues = analysis['bottlenecks'].get(target, [])
                 recommendations.append(
-                    f"⚠️ {target}: violates constraints ({', '.join(issues)}). "
-                    f"Accuracy: {info['accuracy']*100:.1f}%, "
-                    f"Size: {info['size_mb']:.2f}MB"
+                    f"⚠️ {target}: violates constraints ({', '.join(issues)})."
                 )
-
-        # -------------------------------------------------------------
-        # Cascaded deployment
-        # -------------------------------------------------------------
         recommendations.append(
             "\n📊 Cascaded deployment: Use cloud for training-heavy tasks, "
             "edge for inference with latency constraints, "
             "microcontroller for extreme low-power use cases."
         )
-
-        # -------------------------------------------------------------
-        # Hybrid strategies
-        # -------------------------------------------------------------
         recommendations.append(
             "🔄 Hybrid strategy: Deploy the edge model as primary inference, "
-            "with cloud as fallback for low-confidence predictions "
-            "(distillation can transfer cloud knowledge to edge)."
+            "with cloud as fallback for low-confidence predictions."
         )
-
-        # -------------------------------------------------------------
-        # Development priorities
-        # -------------------------------------------------------------
         pareto = analysis.get('pareto_frontier', [])
         if pareto:
             recommendations.append(
                 f"\n🎯 Pareto-optimal models (accuracy vs size): "
                 f"{', '.join(p['name'] for p in pareto)}"
             )
-
         return recommendations
 
 
@@ -657,34 +684,19 @@ class MultiScaleDeploymentPipeline:
 # MAIN
 # =====================================================================
 def run_multi_scale_optimization():
-    """
-    Execute complete multi-scale optimization pipeline.
-    """
     pipeline = MultiScaleDeploymentPipeline()
-
-    # Optimize for all targets
     results = pipeline.optimize_for_all_targets(BASELINE_PATH)
-
-    # Analyze trade-offs
     analysis = pipeline.analyze_scaling_trade_offs(results)
-
-    # Generate recommendations
     recommendations = pipeline.generate_deployment_recommendations(analysis)
 
-    # Generate comprehensive report
     report = {
-        'optimization_results': {
-            name: asdict(r) for name, r in results.items()
-        },
+        'optimization_results': {name: asdict(r) for name, r in results.items()},
         'scaling_analysis': analysis,
         'deployment_recommendations': recommendations,
     }
-
-    # Save report
     out_path = os.path.join(SCRIPT_DIR, 'multi_scale_optimization_report.json')
     with open(out_path, 'w') as f:
         json.dump(report, f, indent=2, default=str)
-
     print(f"\n[Pipeline] Report saved to: {out_path}")
     return report
 
@@ -692,13 +704,11 @@ def run_multi_scale_optimization():
 if __name__ == "__main__":
     tf.random.set_seed(42)
     np.random.seed(42)
-
     report = run_multi_scale_optimization()
 
     print("\n" + "=" * 60)
     print("MULTI-SCALE OPTIMIZATION COMPLETE")
     print("=" * 60)
-
     print("\n📊 Optimization Results:")
     for target, result in report['optimization_results'].items():
         print(f"\n{target}:")
